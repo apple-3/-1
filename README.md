@@ -30,9 +30,3 @@
 - **开发系统**：Windows / Linux（CachyOS）
 
 ## cmake设置
-```cmake
-add_subdirectory(FlightControl/middleware)
-add_subdirectory(FlightControl/interface)
-add_subdirectory(FlightControl/drivers)
-add_subdirectory(FlightControl/apps)
-```
