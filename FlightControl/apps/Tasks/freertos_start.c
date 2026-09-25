@@ -20,7 +20,7 @@
 #include <stdint.h>
 #include <stdio.h>
 uint8_t Buf[NRF24L01_Buf_Len] = {0};
-Remote_data Remote_Control_Data = {500, 500, 500, 0, 0, 0};
+Remote_data Remote_Control_Data = {500, 500, 500, 0, 0, 0, 0};
 Motor_Handle Left_Front;
 Motor_Handle Right_Behind;
 Motor_Handle Left_Behind;
@@ -51,7 +51,7 @@ static float distance = 0.0f;
 static const float pitch_target_scale = 0.1f;     // 0..1000 -> -10..10 deg
 static const float roll_target_scale = 0.1f;      // 0..1000 -> -10..10 deg
 static const float yaw_rate_target_scale = 0.12f; // 0..1000 -> -60..60 deg/s
-static const int16_t max_motor_speed = 1600;
+static const int16_t max_motor_speed = 2000;
 
 #define Motor_Task_stack_size 512
 #define Motor_Task_prioritize 2
@@ -100,9 +100,9 @@ void App_Rtos_Creat(void) {
               MPU_Task_prioritize, &MPU_Task_handle);
 }
 static int16_t clamp_speed(int16_t v) {
-  if (v < 1000)
+  if (v <= 1000)
     return 1000;
-  if (v > max_motor_speed)
+  if (v >= max_motor_speed)
     return max_motor_speed;
   return v;
 }
@@ -139,6 +139,14 @@ void Motor_Task(void *any) {
       Motor_Set_Speed(Right_Behind, 1000);
       int n = snprintf(msg, sizeof(msg), ":%d,%d,%d,%d\n", (int)1000, (int)1000,
                        (int)1000, (int)1000);
+      if (Remote_Control_Data.calibrate == 1) {
+        Motor_Set_Speed(Left_Front, 2000);
+        Motor_Set_Speed(Right_Front, 2000);
+        Motor_Set_Speed(Left_Behind, 2000);
+        Motor_Set_Speed(Right_Behind, 2000);
+        n = snprintf(msg, sizeof(msg), ":%d,%d,%d,%d\n", (int)2000,
+                         (int)2000, (int)2000, (int)2000);
+      }
       HAL_UART_Transmit(&huart1, (uint8_t *)msg, n, HAL_MAX_DELAY);
     } else {
       float pitch_output = F_PID_Up(Pitch_Angle_PID, Pitch_Gyro_PID,

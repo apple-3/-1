@@ -16,4 +16,5 @@ void Com_NRF_Access(Remote_data *data,uint8_t *Buf) {
   data->yaw = (uint16_t)(Buf[12] | (Buf[13] << 8));
   data->shortdown = Buf[14];
   data->fix_high = Buf[15];
+  data->calibrate = Buf[16];
 }
