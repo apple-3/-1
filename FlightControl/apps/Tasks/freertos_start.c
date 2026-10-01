@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include <stdio.h>
 uint8_t Buf[NRF24L01_Buf_Len] = {0};
+uint8_t NRF_RES = 0;
 Remote_data Remote_Control_Data = {500, 500, 500, 0, 0, 0, 0};
 Motor_Handle Left_Front;
 Motor_Handle Right_Behind;
@@ -82,11 +83,11 @@ void Start_Rtos(void) {
   Motor_Start(Left_Behind);
   Motor_Start(Right_Front);
 
-  Pitch_Angle_PID = PID_Creat(2.0f, 0.0f, 0.05f);
-  Roll_Angle_PID = PID_Creat(2.0f, 0.0f, 0.05f);
-  Yaw_Rate_PID = PID_Creat(2.0f, 0.0f, 0.05f);
-  Pitch_Gyro_PID = PID_Creat(1.0f, 0.0f, 0.01f);
-  Roll_Gyro_PID = PID_Creat(1.0f, 0.0f, 0.01f);
+  Pitch_Angle_PID = PID_Creat(1.0f, 0.05f, 0.05f);
+  Roll_Angle_PID = PID_Creat(1.0f, 0.05f, 0.05f);
+  Yaw_Rate_PID = PID_Creat(1.0f, 0, 0.05f);
+  Pitch_Gyro_PID = PID_Creat(1.0f, 0.05f, 0.01f);
+  Roll_Gyro_PID = PID_Creat(1.0f, 0.05f, 0.01f);
 
   App_Rtos_Creat();
   vTaskStartScheduler();
@@ -144,8 +145,8 @@ void Motor_Task(void *any) {
         Motor_Set_Speed(Right_Front, 2000);
         Motor_Set_Speed(Left_Behind, 2000);
         Motor_Set_Speed(Right_Behind, 2000);
-        n = snprintf(msg, sizeof(msg), ":%d,%d,%d,%d\n", (int)2000,
-                         (int)2000, (int)2000, (int)2000);
+        n = snprintf(msg, sizeof(msg), ":%d,%d,%d,%d\n", (int)2000, (int)2000,
+                     (int)2000, (int)2000);
       }
       HAL_UART_Transmit(&huart1, (uint8_t *)msg, n, HAL_MAX_DELAY);
     } else {
@@ -218,6 +219,11 @@ void Config_Task(void *any) {
     uint8_t Telecontrol = NRF_Receive(Buf);
     if (Telecontrol == NRF24L01_RX_OK) {
       Com_NRF_Access(&Remote_Control_Data, Buf);
+    } else {
+      Motor_Set_Speed(Left_Front, 1000);
+      Motor_Set_Speed(Right_Front, 1000);
+      Motor_Set_Speed(Left_Behind, 1000);
+      Motor_Set_Speed(Right_Behind, 1000);
     }
     distance = Ultrasonic_Getdistance();
     vTaskDelay(pdMS_TO_TICKS(20));

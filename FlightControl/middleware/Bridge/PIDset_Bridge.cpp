@@ -11,7 +11,7 @@ void PID_Init() {
   }
 }
 
-static PID<float> F_yaw_rate_pid(2, 0, 0.05);
+static PID<float> F_yaw_rate_pid(1, 0, 0.05);
 
 extern "C" {
 
