@@ -73,7 +73,7 @@ TaskHandle_t Motor_Task_handle;
 void Motor_Task(void *any);
 // 配置任务
 #define Status_Task_stack_size 128
-#define Status_Task_prioritize 1
+#define Status_Task_prioritize 3
 TaskHandle_t Status_Task_handle;
 void Status_Task(void *any);
 // 陀螺仪任务
@@ -141,18 +141,6 @@ void Motor_Task(void *any) {
       dt = 0.001f;
     last_control_tick = now;
 
-    // 神秘状态机，说实话我都不会写捏
-    if (Remote_Control_Data.fix_high == 0 ||
-        Remote_Control_Data.shortdown != 0) {
-      motor_state = MOTOR_STATE_IDLE;
-    } else if (motor_state == MOTOR_STATE_IDLE && throttle < 50.0f) {
-      motor_state = MOTOR_STATE_ARMED;
-    } else if (motor_state == MOTOR_STATE_ARMED && throttle > 50.0f) {
-      motor_state = MOTOR_STATE_ACTIVE;
-    } else if (Remote_Control_Data.shortdown == 0) {
-      motor_state = MOTOR_STATE_UNREMOTE;
-    }
-
     /*
     电机控制逻辑：
       NRF从机接收指令
@@ -161,17 +149,20 @@ void Motor_Task(void *any) {
       激活：激活后通过计算PID串级角速度环按电机对应位置输出PWM信号
       控制器失联：通过内部的姿态计算选择对应的电机控制，比如：降落、大幅度矫正、或者如果有视觉就选没人的地方迫降吧（，当然还有可能还没飞就失联了
     */
-    if (motor_state == MOTOR_STATE_IDLE) {
+    switch (motor_state) {
+    case MOTOR_STATE_IDLE:
       Motor_Set_Speed(Left_Front, 1000);
       Motor_Set_Speed(Right_Front, 1000);
       Motor_Set_Speed(Left_Behind, 1000);
       Motor_Set_Speed(Right_Behind, 1000);
-    } else if (motor_state == MOTOR_STATE_CALI) {
+      break;
+    case MOTOR_STATE_CALI:
       Motor_Set_Speed(Left_Front, 2000);
       Motor_Set_Speed(Right_Front, 2000);
       Motor_Set_Speed(Left_Behind, 2000);
       Motor_Set_Speed(Right_Behind, 2000);
-    } else if (motor_state == MOTOR_STATE_ACTIVE) {
+      break;
+    case MOTOR_STATE_ACTIVE:
       float pitch_output = F_PID_Up(Pitch_Angle_PID, Pitch_Gyro_PID,
                                     pitch_target, MPU_Data_Real.pitch, gy, dt);
       float roll_output = F_PID_Up(Roll_Angle_PID, Roll_Gyro_PID, roll_target,
@@ -196,15 +187,27 @@ void Motor_Task(void *any) {
                        (int)clamp_speed(speed_LF), (int)clamp_speed(speed_RF),
                        (int)clamp_speed(speed_LB), (int)clamp_speed(speed_RB));
       HAL_UART_Transmit(&huart1, (uint8_t *)msg, n, HAL_MAX_DELAY);
-
-    } else if (motor_state == MOTOR_STATE_UNREMOTE) {
-      //这里是蜂鸣器的逻辑，并且最好能计算当前姿态然后选择模式，大概（
-      //比如说单纯平飞失联，慢慢降落或者返程（通过GPS）
-      //再者就是大角度坠机（ =。=那就要看看怎么让电机骚操作救回来了
-    } else if (motor_state == MOTOR_STATE_SLOW) {
-      //这里就是降落吧
+      break;
+    case MOTOR_STATE_UNREMOTE:
+      // 这里是蜂鸣器的逻辑，并且最好能计算当前姿态然后选择模式，大概（
+      // 比如说单纯平飞失联，慢慢降落或者返程（通过GPS）
+      // 再者就是大角度坠机（ =。=那就要看看怎么让电机骚操作救回来了
+      // 这里先默认暂停电机
+      Motor_Set_Speed(Left_Front, 1000);
+      Motor_Set_Speed(Right_Front, 1000);
+      Motor_Set_Speed(Left_Behind, 1000);
+      Motor_Set_Speed(Right_Behind, 1000);
+      n = snprintf(msg, sizeof(msg), ":%d,%d,%d,%d\n", (int)clamp_speed(1000),
+                   (int)clamp_speed(1000), (int)clamp_speed(1000),
+                   (int)clamp_speed(1000));
+      HAL_UART_Transmit(&huart1, (uint8_t *)msg, n, HAL_MAX_DELAY);
+      break;
+    case MOTOR_STATE_SLOW: // 降落
+      break;
+    case MOTOR_STATE_ARMED: // 忠诚！！！
+      break;
     }
-    vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(50));
+    vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(100));
   }
 }
 void MPU_Task(void *any) {
@@ -245,14 +248,41 @@ void MPU_Task(void *any) {
 }
 void Status_Task(void *any) {
   while (1) {
-    Telecontrol = NRF_Receive(Buf);
-    if (Telecontrol == NRF24L01_RX_OK) {
-      Com_NRF_Access(&Remote_Control_Data, Buf);
-      motor_state = MOTOR_STATE_ACTIVE;
-    } else {
-      motor_state = MOTOR_STATE_UNREMOTE;
+    Telecontrol = NRF_Receive(Buf);      // 获取遥控器数据
+    distance = Ultrasonic_Getdistance(); // HCSR-04获取距离信息
+    Com_NRF_Access(&Remote_Control_Data, Buf);
+    // 状态机逻辑
+    switch (motor_state) {
+    case MOTOR_STATE_IDLE:
+      if (Telecontrol == NRF24L01_RX_OK && Remote_Control_Data.shortdown != 0) {
+        motor_state = MOTOR_STATE_ACTIVE;
+      } else if (Remote_Control_Data.calibrate == 1) {
+        motor_state = MOTOR_STATE_CALI;
+      } else {
+        motor_state = MOTOR_STATE_UNREMOTE;
+      }
+      break;
+    case MOTOR_STATE_ACTIVE:
+      if (Telecontrol == NRF24L01_ERROR || Remote_Control_Data.shortdown == 0) {
+        motor_state = MOTOR_STATE_UNREMOTE;
+      }
+      break;
+    case MOTOR_STATE_CALI:
+      if (Telecontrol == NRF24L01_ERROR) {
+        motor_state = MOTOR_STATE_UNREMOTE;
+      }
+      break;
+    case MOTOR_STATE_UNREMOTE:
+      if (Telecontrol == NRF24L01_RX_OK) {
+        motor_state = MOTOR_STATE_IDLE;
+      }
+      break;
+    case MOTOR_STATE_SLOW:
+      break;
+    case MOTOR_STATE_ARMED:
+      break;
     }
-    distance = Ultrasonic_Getdistance();
-    vTaskDelay(pdMS_TO_TICKS(20));
+
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
 }

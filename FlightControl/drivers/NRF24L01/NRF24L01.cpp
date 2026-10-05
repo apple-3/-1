@@ -1,5 +1,6 @@
 #include "NRF24L01.hpp"
 #include "FreeRTOS.h"
+#include "NRF24L01_Bridge.h"
 #include "stm32f4xx_hal.h"
 #include "task.h"
 #include "spi.h"
@@ -67,7 +68,7 @@ uint8_t NRF24L01::NRF24L01_receive(uint8_t *buf) {
         NRF24L01_write_reg(NRF24L01_W_REGISTER + NRF24L01_STATUS, NRF24L01_RX_OK);
         return NRF24L01_RX_OK;
     }
-    return 0;
+    return NRF24L01_ERROR;
 }
 uint8_t NRF24L01::NRF24L01_send(uint8_t *buf) {
     NRF24L01_CE_RESET;
