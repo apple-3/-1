@@ -1,5 +1,6 @@
 #include "NRF24L01.hpp"
 #include "FreeRTOS.h"
+#include "NRF24L01_Bridge.h"
 #include "stm32f4xx_hal.h"
 #include "task.h"
 #include "spi.h"
@@ -11,9 +12,16 @@ uint8_t out_password[7]   = "c8suco";
 static uint8_t NRF24L01_Send_ADDR[5]    = {0xF0, 0xF0, 0xF0, 0xF0, 0xF0};
 static uint8_t NRF24L01_Receive_ADDR[5] = {0xF0, 0xF0, 0xF0, 0xF0, 0xF0};
 
+// SPI 超时时间(ms)：HAL_MAX_DELAY 会让 SPI 异常时无限阻塞 Status_Task
+#define NRF_SPI_TIMEOUT_MS 10U
+
 uint8_t NRF24L01::NRF24L01_SPI_SwapByte(uint8_t Byte) {
     uint8_t receive = 0;
-    HAL_SPI_TransmitReceive(&hspi1, &Byte, &receive, 1, HAL_MAX_DELAY);
+    // 超时/出错时返回 0，调用方读到的寄存器值即 0，
+    // 不会误判 STATUS 的 RX_OK 位，最终返回 NRF24L01_ERROR
+    if (HAL_SPI_TransmitReceive(&hspi1, &Byte, &receive, 1, NRF_SPI_TIMEOUT_MS) != HAL_OK) {
+        return 0;
+    }
     return receive;
 }
 void NRF24L01::NRF24L01_write_reg(uint8_t reg, uint8_t value) {
@@ -67,7 +75,7 @@ uint8_t NRF24L01::NRF24L01_receive(uint8_t *buf) {
         NRF24L01_write_reg(NRF24L01_W_REGISTER + NRF24L01_STATUS, NRF24L01_RX_OK);
         return NRF24L01_RX_OK;
     }
-    return 0;
+    return NRF24L01_ERROR;
 }
 uint8_t NRF24L01::NRF24L01_send(uint8_t *buf) {
     NRF24L01_CE_RESET;

@@ -151,7 +151,8 @@ See http://www.FreeRTOS.org/RTOS-Cortex-M3-M4.html. */
 /* Normal assert() semantics without relying on the provision of an assert.h
 header file. */
 /* USER CODE BEGIN 1 */
-#define configASSERT( x ) if ((x) == 0) {taskDISABLE_INTERRUPTS(); for( ;; );}
+extern volatile uint32_t g_fault_code;
+#define configASSERT( x ) if ((x) == 0) {g_fault_code = 6; taskDISABLE_INTERRUPTS(); for( ;; );}
 /* USER CODE END 1 */
 
 /* Definitions that map the FreeRTOS port interrupt handlers to their CMSIS
@@ -165,6 +166,10 @@ standard names. */
 
 /* USER CODE BEGIN Defines */
 /* Section where parameter definitions can be added (for instance, to override default ones in FreeRTOS.h) */
+/* 栈溢出检测：2 = 任务创建时把栈填 0xA5，任务切换时校验栈尾。
+   命中会调用 vApplicationStackOverflowHook()（在 freertos_start.c 中实现），
+   否则栈溢出只会静默踩坏相邻内存，表现为"随机卡死" */
+#define configCHECK_FOR_STACK_OVERFLOW 2
 /* USER CODE END Defines */
 
 #endif /* FREERTOS_CONFIG_H */
