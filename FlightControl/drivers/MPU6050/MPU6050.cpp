@@ -117,8 +117,13 @@ void MPU6050::Zero_Offset() {
   int sample_count = 0;
   const int required_stable = 100; // 连续 100 次平稳才算达标
   const int16_t threshold = 400;   // 单轴最大允许前后跳变
+  // 重试上限：机身有震动时永远凑不齐 required_stable，
+  // 必须能退出，否则会卡死在调度器启动前的 Start_Rtos() 里
+  const int max_attempts = 1000;
+  int attempts = 0;
 
-  while (stable_count < required_stable) {
+  while (stable_count < required_stable && attempts < max_attempts) {
+    attempts++;
     // 一次读出全部 14 字节：accel(6) + temp(2) + gyro(6)
     if (Hal_Read(_ADDR, mpu6050_accel_out, Buf, 14) != 0)
       return;
@@ -165,6 +170,10 @@ void MPU6050::Zero_Offset() {
     for (volatile uint32_t j = 0; j < 10000; j++)
       ;
   }
+
+  // 到重试上限仍没采到平稳样本：保持原零偏直接返回，避免除零和卡死
+  if (sample_count == 0)
+    return;
 
   // ----- 阶段 2：计算零偏（原始 ADC 值）-----
   // 加速度计：静止时应当为 [0, 0, +1g]（1g = 16384）

@@ -66,14 +66,30 @@ static const float roll_target_scale = 0.1f;      // 0..1000 -> -10..10 deg
 static const float yaw_rate_target_scale = 0.12f; // 0..1200 -> -60..60 deg
 static const int16_t max_motor_speed = 2000;
 
+//MPU_Task 生产、Motor_Task 消费的姿态快照。
+//两个任务优先级不同又没有同步，直接跨任务读写全局量会读到半更新的数据，
+//所以生产端和消费端都放在临界区里整块拷贝
+typedef struct {
+  float roll, pitch, yaw; // MPU_Data_Real 的副本
+  float gx, gy, gz;       // 三轴角速度的副本
+} Attitude_Snapshot;
+
+static Attitude_Snapshot attitude = {0, 0, 0, 0, 0, 0};
+
+//遥控链路超时(ms)：NRF_Receive 只是轮询NRF的 STATUS 寄存器，
+//取不到数据只说明"这一轮刚好没收到"，不代表失联。
+//只有超过这个时间都没收到有效数据，才判定链路断开
+#define REMOTE_LINK_TIMEOUT_MS 500U
+static TickType_t last_remote_rx_tick = 0;
+
 // 电机任务
 #define Motor_Task_stack_size 512
 #define Motor_Task_prioritize 2
 TaskHandle_t Motor_Task_handle;
 void Motor_Task(void *any);
 // 配置任务
-#define Status_Task_stack_size 128
-#define Status_Task_prioritize 3
+#define Status_Task_stack_size 256
+#define Status_Task_prioritize 1
 TaskHandle_t Status_Task_handle;
 void Status_Task(void *any);
 // 陀螺仪任务
@@ -81,6 +97,18 @@ void Status_Task(void *any);
 #define MPU_Task_prioritize 2
 TaskHandle_t MPU_Task_handle;
 void MPU_Task(void *any);
+
+//栈溢出钩子：命中说明有任务爆栈
+//溢出的任务句柄/名字分别是 g_overflow_task/g_overflow_task_name，断在这就能看出是谁
+TaskHandle_t g_overflow_task = 0;
+volatile char *g_overflow_task_name = 0;
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName) {
+  g_overflow_task = xTask;
+  g_overflow_task_name = pcTaskName;
+  taskDISABLE_INTERRUPTS();
+  for (;;) {
+  }
+}
 
 void Start_Rtos(void) {
   NRF_Init();
@@ -123,17 +151,32 @@ static int16_t clamp_speed(int16_t v) {
   return v;
 }
 
+#define UART_TX_TIMEOUT_MS 20U
+static void Uart_Send_Motors(int16_t lf, int16_t rf, int16_t lb, int16_t rb) {
+  int n = snprintf(msg, sizeof(msg), ":%d,%d,%d,%d\n", (int)lf, (int)rf, (int)lb,
+                   (int)rb);
+  if (n > 0) {
+    HAL_UART_Transmit(&huart1, (uint8_t *)msg, (uint16_t)n, UART_TX_TIMEOUT_MS);
+  }
+}
+
 void Motor_Task(void *any) {
   TickType_t last_wake = xTaskGetTickCount();
   while (1) {
-    float throttle = (float)Remote_Control_Data.thr;
+    Remote_data remote;
+    Attitude_Snapshot att;
+    MotorState state;
+    taskENTER_CRITICAL();
+    remote = Remote_Control_Data;
+    att = attitude;
+    state = motor_state;
+    taskEXIT_CRITICAL();
+
+    float throttle = (float)remote.thr;
     float base_speed = 1000.0f + throttle;
-    float pitch_target =
-        ((float)Remote_Control_Data.pit - 500.0f) * pitch_target_scale;
-    float roll_target =
-        ((float)Remote_Control_Data.rol - 500.0f) * roll_target_scale;
-    float yaw_target =
-        ((float)Remote_Control_Data.yaw - 500.0f) * yaw_rate_target_scale;
+    float pitch_target = ((float)remote.pit - 500.0f) * pitch_target_scale;
+    float roll_target = ((float)remote.rol - 500.0f) * roll_target_scale;
+    float yaw_target = ((float)remote.yaw - 500.0f) * yaw_rate_target_scale;
 
     TickType_t now = xTaskGetTickCount();
     float dt = (now - last_control_tick) * portTICK_PERIOD_MS / 1000.0f;
@@ -149,25 +192,28 @@ void Motor_Task(void *any) {
       激活：激活后通过计算PID串级角速度环按电机对应位置输出PWM信号
       控制器失联：通过内部的姿态计算选择对应的电机控制，比如：降落、大幅度矫正、或者如果有视觉就选没人的地方迫降吧（，当然还有可能还没飞就失联了
     */
-    switch (motor_state) {
+    switch (state) {
     case MOTOR_STATE_IDLE:
       Motor_Set_Speed(Left_Front, 1000);
       Motor_Set_Speed(Right_Front, 1000);
       Motor_Set_Speed(Left_Behind, 1000);
       Motor_Set_Speed(Right_Behind, 1000);
+      //每个状态都上报，避免状态切换时串口流出现空档
+      Uart_Send_Motors(1000, 1000, 1000, 1000);
       break;
     case MOTOR_STATE_CALI:
       Motor_Set_Speed(Left_Front, 2000);
       Motor_Set_Speed(Right_Front, 2000);
       Motor_Set_Speed(Left_Behind, 2000);
       Motor_Set_Speed(Right_Behind, 2000);
+      Uart_Send_Motors(2000, 2000, 2000, 2000);
       break;
     case MOTOR_STATE_ACTIVE:
       float pitch_output = F_PID_Up(Pitch_Angle_PID, Pitch_Gyro_PID,
-                                    pitch_target, MPU_Data_Real.pitch, gy, dt);
+                                    pitch_target, att.pitch, att.gy, dt);
       float roll_output = F_PID_Up(Roll_Angle_PID, Roll_Gyro_PID, roll_target,
-                                   MPU_Data_Real.roll, gx, dt);
-      float yaw_output = PID_Yaw_Update_Float(yaw_target, gz, dt);
+                                   att.roll, att.gx, dt);
+      float yaw_output = PID_Yaw_Update_Float(yaw_target, att.gz, dt);
 
       int16_t speed_LB =
           (int16_t)(base_speed - pitch_output + roll_output - yaw_output);
@@ -183,31 +229,26 @@ void Motor_Task(void *any) {
       Motor_Set_Speed(Left_Behind, clamp_speed(speed_LB));
       Motor_Set_Speed(Right_Behind, clamp_speed(speed_RB));
 
-      int n = snprintf(msg, sizeof(msg), ":%d,%d,%d,%d\n",
-                       (int)clamp_speed(speed_LF), (int)clamp_speed(speed_RF),
-                       (int)clamp_speed(speed_LB), (int)clamp_speed(speed_RB));
-      HAL_UART_Transmit(&huart1, (uint8_t *)msg, n, HAL_MAX_DELAY);
+      Uart_Send_Motors(clamp_speed(speed_LF), clamp_speed(speed_RF),
+                       clamp_speed(speed_LB), clamp_speed(speed_RB));
       break;
     case MOTOR_STATE_UNREMOTE:
       // 这里是蜂鸣器的逻辑，并且最好能计算当前姿态然后选择模式，大概（
       // 比如说单纯平飞失联，慢慢降落或者返程（通过GPS）
-      // 再者就是大角度坠机（ =。=那就要看看怎么让电机骚操作救回来了
+      // 再者就是大角度坠机 =。=那就要看看怎么让电机骚操作救回来了
       // 这里先默认暂停电机
       Motor_Set_Speed(Left_Front, 1000);
       Motor_Set_Speed(Right_Front, 1000);
       Motor_Set_Speed(Left_Behind, 1000);
       Motor_Set_Speed(Right_Behind, 1000);
-      n = snprintf(msg, sizeof(msg), ":%d,%d,%d,%d\n", (int)clamp_speed(1000),
-                   (int)clamp_speed(1000), (int)clamp_speed(1000),
-                   (int)clamp_speed(1000));
-      HAL_UART_Transmit(&huart1, (uint8_t *)msg, n, HAL_MAX_DELAY);
+      Uart_Send_Motors(1000, 1000, 1000, 1000);
       break;
     case MOTOR_STATE_SLOW: // 降落
       break;
     case MOTOR_STATE_ARMED: // 忠诚！！！
       break;
     }
-    vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(100));
+    vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(50));
   }
 }
 void MPU_Task(void *any) {
@@ -243,37 +284,60 @@ void MPU_Task(void *any) {
     MPU_Data_Last.roll = MPU_Data_Real.roll;
     MPU_Data_Last.yaw = MPU_Data_Real.yaw;
 
+    //整块发布给Motor_Task避免它读到只更新了一半的姿态
+    taskENTER_CRITICAL();
+    attitude.roll = MPU_Data_Real.roll;
+    attitude.pitch = MPU_Data_Real.pitch;
+    attitude.yaw = MPU_Data_Real.yaw;
+    attitude.gx = gx;
+    attitude.gy = gy;
+    attitude.gz = gz;
+    taskEXIT_CRITICAL();
+
     vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(6));
   }
 }
 void Status_Task(void *any) {
+  //启动时先把"上次收到数据"的时间推到超时窗口之外，
+  //即初始化时判定为失联，收到第一帧有效数据后才算连上
+  last_remote_rx_tick =
+      xTaskGetTickCount() - pdMS_TO_TICKS(REMOTE_LINK_TIMEOUT_MS);
   while (1) {
-    Telecontrol = NRF_Receive(Buf);      // 获取遥控器数据
+    TickType_t now = xTaskGetTickCount();
+    Telecontrol = NRF_Receive(Buf); // 获取遥控器数据
+    if (Telecontrol == NRF24L01_RX_OK) {
+      last_remote_rx_tick = now;
+      Com_NRF_Access(&Remote_Control_Data, Buf);
+    }
     distance = Ultrasonic_Getdistance(); // HCSR-04获取距离信息
-    Com_NRF_Access(&Remote_Control_Data, Buf);
+    //链路判定：超时窗口内收到过数据就算链路正常，
+    //这样遥控发包间隔大于轮询周期时不会把状态反复打回 UNREMOTE
+    uint8_t link_ok = (now - last_remote_rx_tick) <
+                      pdMS_TO_TICKS(REMOTE_LINK_TIMEOUT_MS);
+
     // 状态机逻辑
     switch (motor_state) {
     case MOTOR_STATE_IDLE:
-      if (Telecontrol == NRF24L01_RX_OK && Remote_Control_Data.shortdown != 0) {
-        motor_state = MOTOR_STATE_ACTIVE;
+      if (link_ok == 0) {
+        motor_state = MOTOR_STATE_UNREMOTE; // 真失联
+      } else if (Remote_Control_Data.shortdown != 0) {
+        motor_state = MOTOR_STATE_ACTIVE; // 已解锁
       } else if (Remote_Control_Data.calibrate == 1) {
         motor_state = MOTOR_STATE_CALI;
-      } else {
-        motor_state = MOTOR_STATE_UNREMOTE;
       }
       break;
     case MOTOR_STATE_ACTIVE:
-      if (Telecontrol == NRF24L01_ERROR || Remote_Control_Data.shortdown == 0) {
+      if (link_ok == 0 || Remote_Control_Data.shortdown == 0) {
         motor_state = MOTOR_STATE_UNREMOTE;
       }
       break;
     case MOTOR_STATE_CALI:
-      if (Telecontrol == NRF24L01_ERROR) {
+      if (link_ok == 0) {
         motor_state = MOTOR_STATE_UNREMOTE;
       }
       break;
     case MOTOR_STATE_UNREMOTE:
-      if (Telecontrol == NRF24L01_RX_OK) {
+      if (link_ok != 0 && Remote_Control_Data.shortdown != 0) {
         motor_state = MOTOR_STATE_IDLE;
       }
       break;
@@ -283,6 +347,6 @@ void Status_Task(void *any) {
       break;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
