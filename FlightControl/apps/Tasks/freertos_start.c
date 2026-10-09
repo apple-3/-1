@@ -20,7 +20,24 @@
 #include <stdint.h>
 #include <stdio.h>
 
+// 电机任务
+#define Motor_Task_stack_size 512
+#define Motor_Task_prioritize 2
+TaskHandle_t Motor_Task_handle;
+void Motor_Task(void *any);
+// 配置任务
+#define Status_Task_stack_size 256
+#define Status_Task_prioritize 1
+TaskHandle_t Status_Task_handle;
+void Status_Task(void *any);
+// 陀螺仪任务
+#define MPU_Task_stack_size 512
+#define MPU_Task_prioritize 2
+TaskHandle_t MPU_Task_handle;
+void MPU_Task(void *any);
+
 uint8_t Buf[NRF24L01_Buf_Len] = {0};
+uint8_t Send_Buf[NRF24L01_Buf_Len] = {'c', '8', 's', 'u', 'c', 'o'};
 uint8_t Telecontrol = 0;                                       // 遥控器接收状态
 Remote_data Remote_Control_Data = {500, 500, 500, 0, 0, 0, 0}; // 遥控器接收数据
 
@@ -50,11 +67,11 @@ char msg[128];
 
 // 状态机枚举
 typedef enum {
-  MOTOR_STATE_IDLE = 0,
+  MOTOR_STATE_UNREMOTE = 0,
+  MOTOR_STATE_IDLE,
   MOTOR_STATE_ARMED, // 你们说我给无人机加制导系统会不会被抓进去
   MOTOR_STATE_ACTIVE,
   MOTOR_STATE_CALI,
-  MOTOR_STATE_UNREMOTE,
   MOTOR_STATE_SLOW,
 } MotorState;
 
@@ -66,9 +83,9 @@ static const float roll_target_scale = 0.1f;      // 0..1000 -> -10..10 deg
 static const float yaw_rate_target_scale = 0.12f; // 0..1200 -> -60..60 deg
 static const int16_t max_motor_speed = 2000;
 
-//MPU_Task 生产、Motor_Task 消费的姿态快照。
-//两个任务优先级不同又没有同步，直接跨任务读写全局量会读到半更新的数据，
-//所以生产端和消费端都放在临界区里整块拷贝
+// MPU_Task 生产、Motor_Task 消费的姿态快照。
+// 两个任务优先级不同又没有同步，直接跨任务读写全局量会读到半更新的数据，
+// 所以生产端和消费端都放在临界区里整块拷贝
 typedef struct {
   float roll, pitch, yaw; // MPU_Data_Real 的副本
   float gx, gy, gz;       // 三轴角速度的副本
@@ -76,30 +93,15 @@ typedef struct {
 
 static Attitude_Snapshot attitude = {0, 0, 0, 0, 0, 0};
 
-//遥控链路超时(ms)：NRF_Receive 只是轮询NRF的 STATUS 寄存器，
-//取不到数据只说明"这一轮刚好没收到"，不代表失联。
-//只有超过这个时间都没收到有效数据，才判定链路断开
+// 遥控链路超时(ms)：NRF_Receive 只是轮询NRF的 STATUS 寄存器，
+// 取不到数据只说明"这一轮刚好没收到"，不代表失联。
+// 只有超过这个时间都没收到有效数据，才判定链路断开
 #define REMOTE_LINK_TIMEOUT_MS 500U
 static TickType_t last_remote_rx_tick = 0;
 
-// 电机任务
-#define Motor_Task_stack_size 512
-#define Motor_Task_prioritize 2
-TaskHandle_t Motor_Task_handle;
-void Motor_Task(void *any);
-// 配置任务
-#define Status_Task_stack_size 256
-#define Status_Task_prioritize 1
-TaskHandle_t Status_Task_handle;
-void Status_Task(void *any);
-// 陀螺仪任务
-#define MPU_Task_stack_size 512
-#define MPU_Task_prioritize 2
-TaskHandle_t MPU_Task_handle;
-void MPU_Task(void *any);
-
-//栈溢出钩子：命中说明有任务爆栈
-//溢出的任务句柄/名字分别是 g_overflow_task/g_overflow_task_name，断在这就能看出是谁
+// 栈溢出钩子：命中说明有任务爆栈
+// 溢出的任务句柄/名字分别是
+// g_overflow_task/g_overflow_task_name，断在这就能看出是谁
 TaskHandle_t g_overflow_task = 0;
 volatile char *g_overflow_task_name = 0;
 void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName) {
@@ -153,8 +155,8 @@ static int16_t clamp_speed(int16_t v) {
 
 #define UART_TX_TIMEOUT_MS 20U
 static void Uart_Send_Motors(int16_t lf, int16_t rf, int16_t lb, int16_t rb) {
-  int n = snprintf(msg, sizeof(msg), ":%d,%d,%d,%d\n", (int)lf, (int)rf, (int)lb,
-                   (int)rb);
+  int n = snprintf(msg, sizeof(msg), ":%d,%d,%d,%d\n", (int)lf, (int)rf,
+                   (int)lb, (int)rb);
   if (n > 0) {
     HAL_UART_Transmit(&huart1, (uint8_t *)msg, (uint16_t)n, UART_TX_TIMEOUT_MS);
   }
@@ -198,8 +200,9 @@ void Motor_Task(void *any) {
       Motor_Set_Speed(Right_Front, 1000);
       Motor_Set_Speed(Left_Behind, 1000);
       Motor_Set_Speed(Right_Behind, 1000);
-      //每个状态都上报，避免状态切换时串口流出现空档
+      // 每个状态都上报，避免状态切换时串口流出现空档
       Uart_Send_Motors(1000, 1000, 1000, 1000);
+      Send_Buf[20] = MOTOR_STATE_IDLE;
       break;
     case MOTOR_STATE_CALI:
       Motor_Set_Speed(Left_Front, 2000);
@@ -215,22 +218,29 @@ void Motor_Task(void *any) {
                                    att.roll, att.gx, dt);
       float yaw_output = PID_Yaw_Update_Float(yaw_target, att.gz, dt);
 
-      int16_t speed_LB =
-          (int16_t)(base_speed - pitch_output + roll_output - yaw_output);
-      int16_t speed_RB =
-          (int16_t)(base_speed - pitch_output - roll_output + yaw_output);
-      int16_t speed_LF =
-          (int16_t)(base_speed + pitch_output + roll_output + yaw_output);
-      int16_t speed_RF =
-          (int16_t)(base_speed + pitch_output - roll_output - yaw_output);
+      int16_t speed_LB = clamp_speed(
+          (int16_t)(base_speed - pitch_output + roll_output - yaw_output));
+      int16_t speed_RB = clamp_speed(
+          (int16_t)(base_speed - pitch_output - roll_output + yaw_output));
+      int16_t speed_LF = clamp_speed(
+          (int16_t)(base_speed + pitch_output + roll_output + yaw_output));
+      int16_t speed_RF = clamp_speed(
+          (int16_t)(base_speed + pitch_output - roll_output - yaw_output));
 
-      Motor_Set_Speed(Left_Front, clamp_speed(speed_LF));
-      Motor_Set_Speed(Right_Front, clamp_speed(speed_RF));
-      Motor_Set_Speed(Left_Behind, clamp_speed(speed_LB));
-      Motor_Set_Speed(Right_Behind, clamp_speed(speed_RB));
-
-      Uart_Send_Motors(clamp_speed(speed_LF), clamp_speed(speed_RF),
-                       clamp_speed(speed_LB), clamp_speed(speed_RB));
+      Motor_Set_Speed(Left_Front, speed_LF);
+      Motor_Set_Speed(Right_Front, speed_RF);
+      Motor_Set_Speed(Left_Behind, speed_LB);
+      Motor_Set_Speed(Right_Behind, speed_RB);
+      Send_Buf[6] = (uint8_t)(speed_LF & 0xFF);
+      Send_Buf[7] = (uint8_t)((speed_LF >> 8) & 0xFF);
+      Send_Buf[8] = (uint8_t)(speed_RF & 0xFF);
+      Send_Buf[9] = (uint8_t)((speed_RF >> 8) & 0xFF);
+      Send_Buf[10] = (uint8_t)(speed_LB & 0xFF);
+      Send_Buf[11] = (uint8_t)((speed_LB >> 8) & 0xFF);
+      Send_Buf[12] = (uint8_t)(speed_RB & 0xFF);
+      Send_Buf[13] = (uint8_t)((speed_RB >> 8) & 0xFF);
+      Send_Buf[20] = MOTOR_STATE_ACTIVE; // 通信正常且电机接收信号正常
+      Uart_Send_Motors(speed_LF, speed_RF, speed_LB, speed_RB);
       break;
     case MOTOR_STATE_UNREMOTE:
       // 这里是蜂鸣器的逻辑，并且最好能计算当前姿态然后选择模式，大概（
@@ -242,6 +252,7 @@ void Motor_Task(void *any) {
       Motor_Set_Speed(Left_Behind, 1000);
       Motor_Set_Speed(Right_Behind, 1000);
       Uart_Send_Motors(1000, 1000, 1000, 1000);
+      Send_Buf[20] = MOTOR_STATE_UNREMOTE;
       break;
     case MOTOR_STATE_SLOW: // 降落
       break;
@@ -284,11 +295,18 @@ void MPU_Task(void *any) {
     MPU_Data_Last.roll = MPU_Data_Real.roll;
     MPU_Data_Last.yaw = MPU_Data_Real.yaw;
 
-    //整块发布给Motor_Task避免它读到只更新了一半的姿态
+    // 整块发布给Motor_Task避免它读到只更新了一半的姿态
     taskENTER_CRITICAL();
     attitude.roll = MPU_Data_Real.roll;
     attitude.pitch = MPU_Data_Real.pitch;
     attitude.yaw = MPU_Data_Real.yaw;
+    Send_Buf[14] = (uint8_t)((uint16_t)attitude.roll & 0xFF);
+    Send_Buf[15] = ((uint8_t)(uint16_t)attitude.roll >> 8 & 0xFF);
+    Send_Buf[16] = (uint8_t)((uint16_t)attitude.pitch & 0xFF);
+    Send_Buf[17] = ((uint8_t)(uint16_t)attitude.pitch >> 8 & 0xFF);
+    Send_Buf[18] = (uint8_t)((uint16_t)attitude.yaw & 0xFF);
+    Send_Buf[19] = ((uint8_t)(uint16_t)attitude.yaw >> 8 & 0xFF);
+    Send_Buf[21] = 1;
     attitude.gx = gx;
     attitude.gy = gy;
     attitude.gz = gz;
@@ -298,22 +316,27 @@ void MPU_Task(void *any) {
   }
 }
 void Status_Task(void *any) {
-  //启动时先把"上次收到数据"的时间推到超时窗口之外，
-  //即初始化时判定为失联，收到第一帧有效数据后才算连上
+  // 启动时先把"上次收到数据"的时间推到超时窗口之外，
+  // 即初始化时判定为失联，收到第一帧有效数据后才算连上
   last_remote_rx_tick =
       xTaskGetTickCount() - pdMS_TO_TICKS(REMOTE_LINK_TIMEOUT_MS);
   while (1) {
     TickType_t now = xTaskGetTickCount();
     Telecontrol = NRF_Receive(Buf); // 获取遥控器数据
+    vTaskDelay(1);
+    /*
+    NRF_Send有问题会导致接收状态不正常
+    */
+    // NRF_Send(Send_Buf);
     if (Telecontrol == NRF24L01_RX_OK) {
       last_remote_rx_tick = now;
       Com_NRF_Access(&Remote_Control_Data, Buf);
     }
     distance = Ultrasonic_Getdistance(); // HCSR-04获取距离信息
-    //链路判定：超时窗口内收到过数据就算链路正常，
-    //这样遥控发包间隔大于轮询周期时不会把状态反复打回 UNREMOTE
-    uint8_t link_ok = (now - last_remote_rx_tick) <
-                      pdMS_TO_TICKS(REMOTE_LINK_TIMEOUT_MS);
+    // 链路判定：超时窗口内收到过数据就算链路正常，
+    // 这样遥控发包间隔大于轮询周期时不会把状态反复打回 UNREMOTE
+    uint8_t link_ok =
+        (now - last_remote_rx_tick) < pdMS_TO_TICKS(REMOTE_LINK_TIMEOUT_MS);
 
     // 状态机逻辑
     switch (motor_state) {
@@ -346,7 +369,6 @@ void Status_Task(void *any) {
     case MOTOR_STATE_ARMED:
       break;
     }
-
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
