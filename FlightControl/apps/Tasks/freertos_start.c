@@ -8,6 +8,8 @@
 #include "PIDset_Bridge.h"
 #include "main.h"
 #include "portmacro.h"
+#include "projdefs.h"
+#include "semphr.h"
 #include "stm32_hal_legacy.h"
 #include "stm32f4xx_hal.h"
 #include "stm32f4xx_hal_gpio.h"
@@ -19,7 +21,6 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
-
 // 电机任务
 #define Motor_Task_stack_size 512
 #define Motor_Task_prioritize 2
@@ -27,7 +28,7 @@ TaskHandle_t Motor_Task_handle;
 void Motor_Task(void *any);
 // 配置任务
 #define Status_Task_stack_size 256
-#define Status_Task_prioritize 1
+#define Status_Task_prioritize 3
 TaskHandle_t Status_Task_handle;
 void Status_Task(void *any);
 // 陀螺仪任务
@@ -35,6 +36,11 @@ void Status_Task(void *any);
 #define MPU_Task_prioritize 2
 TaskHandle_t MPU_Task_handle;
 void MPU_Task(void *any);
+#define NRF_Send_stack_size 128
+#define NRF_Send_Task_prioritize 1
+TaskHandle_t NRF_Send_handle;
+void NRF_Send_Task(void *any);
+QueueHandle_t sem_handle;
 
 uint8_t Buf[NRF24L01_Buf_Len] = {0};
 uint8_t Send_Buf[NRF24L01_Buf_Len] = {'c', '8', 's', 'u', 'c', 'o'};
@@ -132,6 +138,8 @@ void Start_Rtos(void) {
   Pitch_Gyro_PID = PID_Creat(1.0f, 0.05f, 0.01f);
   Roll_Gyro_PID = PID_Creat(1.0f, 0.05f, 0.01f);
 
+  vSemaphoreCreateBinary(sem_handle);
+
   App_Rtos_Creat();
   vTaskStartScheduler();
 }
@@ -142,6 +150,8 @@ void App_Rtos_Creat(void) {
               Status_Task_prioritize, &Status_Task_handle);
   xTaskCreate(MPU_Task, "MPU_Task", MPU_Task_stack_size, NULL,
               MPU_Task_prioritize, &MPU_Task_handle);
+  xTaskCreate(NRF_Send_Task, "NRF_Send_Task", NRF_Send_stack_size, NULL,
+              NRF_Send_Task_prioritize, &NRF_Send_handle);
 }
 
 // PWM限幅
@@ -259,6 +269,7 @@ void Motor_Task(void *any) {
     case MOTOR_STATE_ARMED: // 忠诚！！！
       break;
     }
+    // uint8_t a = NRF_Send(Send_Buf);
     vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(50));
   }
 }
@@ -323,7 +334,6 @@ void Status_Task(void *any) {
   while (1) {
     TickType_t now = xTaskGetTickCount();
     Telecontrol = NRF_Receive(Buf); // 获取遥控器数据
-    vTaskDelay(1);
     /*
     NRF_Send有问题会导致接收状态不正常
     */
@@ -331,6 +341,7 @@ void Status_Task(void *any) {
     if (Telecontrol == NRF24L01_RX_OK) {
       last_remote_rx_tick = now;
       Com_NRF_Access(&Remote_Control_Data, Buf);
+      xSemaphoreGive(sem_handle);
     }
     distance = Ultrasonic_Getdistance(); // HCSR-04获取距离信息
     // 链路判定：超时窗口内收到过数据就算链路正常，
@@ -370,5 +381,15 @@ void Status_Task(void *any) {
       break;
     }
     vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+void NRF_Send_Task(void *any) {
+  BaseType_t res=0;
+  while (1) {
+    res = xSemaphoreTake(sem_handle, portMAX_DELAY);
+    if (res==pdPASS) {
+      NRF_Send(Send_Buf);
+    }
+    vTaskDelay(1000);
   }
 }
